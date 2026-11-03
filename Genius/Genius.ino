@@ -1,73 +1,62 @@
-/*
-  Genius / Simon - Arduino Mega 2560
-  LEDs: D2, D3, D4, D5
-  Botoes do jogo: D21, D20, D19, D18 (INT0 a INT3)
-  Botao iniciar/reiniciar: D53 (PCINT0)
-  Buzzer: D7
-  Display do nivel: D22 a D28 (A a G)
-  Display do tempo: D30 a D36 (A a G)
-  Timer1: contagem regressiva de 1 segundo.
-  Timer3: atualizacao dos displays.
-  Sem delay() na logica principal.
-*/
+//Genius - Arduino Mega 2560
 
 #include <Arduino.h>
 #include <avr/interrupt.h>
 
 // ---------------- PINOS ----------------
 
-const uint8_t ledPins[4] = {2, 3, 4, 5};
+const uint8_t pinosLeds[4] = {2, 3, 4, 5};
 
-const uint8_t segmentPinsLevel[7] = {
+const uint8_t pinosSegmentosNivel[7] = {
   22, 23, 24, 25, 26, 27, 28
 };
 
-const uint8_t segmentPinsTime[7] = {
+const uint8_t pinosSegmentosTempo[7] = {
   30, 31, 32, 33, 34, 35, 36
 };
 
-const uint8_t buzzerPin = 7;
+const uint8_t pinoBuzzer = 7;
 
 // ---------------- ESTADOS DO JOGO ----------------
 
-enum GameState : uint8_t {
-  WAIT_START,
-  SHOW_SEQUENCE,
-  WAIT_INPUT,
-  GAME_OVER
+enum EstadoDoJogo : uint8_t {
+  esperaInicio,
+  mostraSequencia,
+  esperaJogador,
+  gameover
 };
 
-volatile uint8_t pressedButton = 255;
-volatile bool restartRequested = false;
-volatile uint8_t secondsLeft = 0;
-volatile bool timeExpired = false;
-volatile GameState state = WAIT_START;
+volatile uint8_t botaoPressionado = 255;
+volatile bool reinicioSolicitado = false;
+volatile uint8_t segundosRestantes = 0;
+volatile bool tempoEsgotado = false;
+volatile EstadoDoJogo estado = esperaInicio;
 
-uint8_t sequence[40];
-uint8_t sequenceLength = 1;
-uint8_t inputIndex = 0;
+uint8_t sequencia[40];
+uint8_t tamanhoSequencia = 1;
+uint8_t indiceJogador = 0;
 
-volatile uint8_t level = 0;
+volatile uint8_t nivelAtual = 0;
 
-uint8_t showIndex = 0;
-uint8_t shownLed = 255;
+uint8_t indiceExibicao = 0;
+uint8_t ledExibido = 255;
 
-uint32_t nextSequenceChange = 0;
-uint32_t lastAcceptedInputMs = 0;
-uint32_t lastRestartMs = 0;
+uint32_t proximaMudancaSequencia = 0;
+uint32_t ultimaEntradaAceitaMs = 0;
+uint32_t ultimoReinicioMs = 0;
 
 // Controle do buzzer sem tone()
-uint32_t beepStopAt = 0;
+uint32_t pararBipEm = 0;
 
 // Controle da animação de Game Over
-uint32_t gameOverAnimStart = 0;
-uint32_t nextBlinkTime = 0;
-bool ledBlinkState = false;
+uint32_t inicioAnimacaoFimDeJogo = 0;
+uint32_t proximaPiscadaLeds = 0;
+bool estadoPiscadaLeds = false;
 
 // ---------------- DISPLAY DE 7 SEGMENTOS ----------------
 
 // Bits correspondentes a A, B, C, D, E, F, G.
-const uint8_t digitMap[10] = {
+const uint8_t mapaDigitos[10] = {
   0b00111111, // 0
   0b00000110, // 1
   0b01011011, // 2
@@ -80,104 +69,104 @@ const uint8_t digitMap[10] = {
   0b01101111  // 9
 };
 
-void setSegments(const uint8_t pins[7], uint8_t value) {
-  if (value > 9) {
-    value = 0;
+void configurarSegmentos(const uint8_t pinos[7], uint8_t valor) {
+  if (valor > 9) {
+    valor = 0;
   }
 
-  uint8_t pattern = digitMap[value];
+  uint8_t padrao = mapaDigitos[valor];
 
   for (uint8_t i = 0; i < 7; i++) {
     digitalWrite(
-      pins[i],
+      pinos[i],
       // LÓGICA INVERTIDA PARA ÂNODO COMUM
-      (pattern & (1 << i)) ? LOW : HIGH 
+      (padrao & (1 << i)) ? LOW : HIGH 
     );
   }
 }
 
 // ---------------- LEDS ----------------
 
-void allLedsOff() {
+void apagarTodosLeds() {
   for (uint8_t i = 0; i < 4; i++) {
-    digitalWrite(ledPins[i], LOW);
+    digitalWrite(pinosLeds[i], LOW);
   }
 }
 
 // ---------------- BUZZER ----------------
 
-void beep(uint16_t frequency, uint16_t durationMs) {
-  (void)frequency;
+void tocarBip(uint16_t frequencia, uint16_t duracaoMs) {
+  (void)frequencia;
 
-  digitalWrite(buzzerPin, HIGH);
-  beepStopAt = millis() + durationMs;
+  digitalWrite(pinoBuzzer, HIGH);
+  pararBipEm = millis() + duracaoMs;
 }
 
-void stopBeep() {
-  digitalWrite(buzzerPin, LOW);
-  beepStopAt = 0;
+void pararBip() {
+  digitalWrite(pinoBuzzer, LOW);
+  pararBipEm = 0;
 }
 
 // ---------------- FIM DE JOGO ----------------
 
-void gameOver() {
-  state = GAME_OVER;
-  secondsLeft = 0;
+void acionarFimDeJogo() {
+  estado = gameover;
+  segundosRestantes = 0;
   
   // Prepara variáveis para piscar LEDs por 3 segundos sem delay()
-  gameOverAnimStart = millis();
-  nextBlinkTime = millis();
-  ledBlinkState = false;
+  inicioAnimacaoFimDeJogo = millis();
+  proximaPiscadaLeds = millis();
+  estadoPiscadaLeds = false;
   
   // Dispara um bip longo (1.5 segundos) de erro
-  beep(200, 1500); 
+  tocarBip(200, 1500); 
 }
 
 // ---------------- INICIAR JOGO ----------------
 
-void startGame() {
-  allLedsOff();
-  stopBeep();
+void iniciarJogo() {
+  apagarTodosLeds();
+  pararBip();
 
-  level = 1;
-  sequenceLength = 1;
-  inputIndex = 0;
+  nivelAtual = 1;
+  tamanhoSequencia = 1;
+  indiceJogador = 0;
 
-  sequence[0] = random(0, 4);
+  sequencia[0] = random(0, 4);
 
-  state = SHOW_SEQUENCE;
+  estado = mostraSequencia;
 
-  showIndex = 0;
-  shownLed = 255;
+  indiceExibicao = 0;
+  ledExibido = 255;
 
-  nextSequenceChange = millis();
+  proximaMudancaSequencia = millis();
 
-  secondsLeft = 0;
-  timeExpired = false;
+  segundosRestantes = 0;
+  tempoEsgotado = false;
 
-  beep(880, 80);
+  tocarBip(880, 80);
 }
 
 // ---------------- INTERRUPCOES DOS BOTOES ----------------
 
-ISR(INT0_vect) { pressedButton = 0; }
-ISR(INT1_vect) { pressedButton = 1; }
-ISR(INT2_vect) { pressedButton = 2; }
-ISR(INT3_vect) { pressedButton = 3; }
+ISR(INT0_vect) { botaoPressionado = 0; }
+ISR(INT1_vect) { botaoPressionado = 1; }
+ISR(INT2_vect) { botaoPressionado = 2; }
+ISR(INT3_vect) { botaoPressionado = 3; }
 
 ISR(PCINT0_vect) {
   if (!(PINB & _BV(PB0))) {
-    restartRequested = true;
+    reinicioSolicitado = true;
   }
 }
 
 // ---------------- TIMER 1 ----------------
 
 ISR(TIMER1_COMPA_vect) {
-  if (state == WAIT_INPUT && secondsLeft > 0) {
-    secondsLeft--;
-    if (secondsLeft == 0) {
-      timeExpired = true;
+  if (estado == esperaJogador && segundosRestantes > 0) {
+    segundosRestantes--;
+    if (segundosRestantes == 0) {
+      tempoEsgotado = true;
     }
   }
 }
@@ -185,13 +174,13 @@ ISR(TIMER1_COMPA_vect) {
 // ---------------- TIMER 3 ----------------
 
 ISR(TIMER3_COMPA_vect) {
-  setSegments(segmentPinsLevel, level % 10);
-  setSegments(segmentPinsTime, secondsLeft % 10);
+  configurarSegmentos(pinosSegmentosNivel, nivelAtual % 10);
+  configurarSegmentos(pinosSegmentosTempo, segundosRestantes % 10);
 }
 
 // ---------------- CONFIGURACAO DAS INTERRUPCOES ----------------
 
-void setupInterrupts() {
+void configurarInterrupcoes() {
   cli();
 
   DDRD &= ~0x0F;
@@ -213,7 +202,7 @@ void setupInterrupts() {
 
 // ---------------- CONFIGURACAO DOS TIMERS ----------------
 
-void setupTimer1() {
+void configurarTimer1() {
   cli();
   TCCR1A = 0;
   TCCR1B = 0;
@@ -225,7 +214,7 @@ void setupTimer1() {
   sei();
 }
 
-void setupTimer3() {
+void configurarTimer3() {
   cli();
   TCCR3A = 0;
   TCCR3B = 0;
@@ -241,155 +230,155 @@ void setupTimer3() {
 
 void setup() {
   for (uint8_t i = 0; i < 4; i++) {
-    pinMode(ledPins[i], OUTPUT);
+    pinMode(pinosLeds[i], OUTPUT);
   }
 
   for (uint8_t i = 0; i < 7; i++) {
-    pinMode(segmentPinsLevel[i], OUTPUT);
-    pinMode(segmentPinsTime[i], OUTPUT);
+    pinMode(pinosSegmentosNivel[i], OUTPUT);
+    pinMode(pinosSegmentosTempo[i], OUTPUT);
   }
 
-  pinMode(buzzerPin, OUTPUT);
+  pinMode(pinoBuzzer, OUTPUT);
   pinMode(53, INPUT_PULLUP);
 
-  allLedsOff();
-  stopBeep();
+  apagarTodosLeds();
+  pararBip();
 
-  setSegments(segmentPinsLevel, 0);
-  setSegments(segmentPinsTime, 0);
+  configurarSegmentos(pinosSegmentosNivel, 0);
+  configurarSegmentos(pinosSegmentosTempo, 0);
 
   randomSeed(analogRead(A0));
 
-  setupInterrupts();
-  setupTimer1();
-  setupTimer3();
+  configurarInterrupcoes();
+  configurarTimer1();
+  configurarTimer3();
 }
 
 // ---------------- LOOP PRINCIPAL ----------------
 
 void loop() {
-  uint32_t now = millis();
+  uint32_t agora = millis();
 
   // Encerra o som (e apaga os LEDs de feedback do clique) quando o tempo termina.
-  if (beepStopAt != 0 && (int32_t)(now - beepStopAt) >= 0) {
-    stopBeep();
+  if (pararBipEm != 0 && (int32_t)(agora - pararBipEm) >= 0) {
+    pararBip();
     // Apaga caso seja o flash rápido de quando o jogador aperta o botão
-    if (state == WAIT_INPUT) allLedsOff(); 
+    if (estado == esperaJogador) apagarTodosLeds(); 
   }
 
   // Inicia ou reinicia o jogo.
-  if (restartRequested) {
+  if (reinicioSolicitado) {
     noInterrupts();
-    restartRequested = false;
+    reinicioSolicitado = false;
     interrupts();
 
     // Filtro anti-ruído (debounce) de 500ms para o Restart físico
-    if (now - lastRestartMs > 500) {
-      lastRestartMs = now;
-      startGame();
+    if (agora - ultimoReinicioMs > 500) {
+      ultimoReinicioMs = agora;
+      iniciarJogo();
     }
   }
 
   // Verifica se o jogador esgotou o tempo.
-  if (timeExpired) {
+  if (tempoEsgotado) {
     noInterrupts();
-    timeExpired = false;
+    tempoEsgotado = false;
     interrupts();
-    gameOver();
+    acionarFimDeJogo();
   }
 
   // ---------------- ANIMAÇÃO DE GAME OVER ----------------
-  if (state == GAME_OVER) {
-    if ((now - gameOverAnimStart) < 3000) {
-      if ((int32_t)(now - nextBlinkTime) >= 0) {
-        ledBlinkState = !ledBlinkState; // Inverte o estado
+  if (estado == gameover) {
+    if ((agora - inicioAnimacaoFimDeJogo) < 3000) {
+      if ((int32_t)(agora - proximaPiscadaLeds) >= 0) {
+        estadoPiscadaLeds = !estadoPiscadaLeds; // Inverte o estado
         for (uint8_t i = 0; i < 4; i++) {
-          digitalWrite(ledPins[i], ledBlinkState ? HIGH : LOW);
+          digitalWrite(pinosLeds[i], estadoPiscadaLeds ? HIGH : LOW);
         }
-        nextBlinkTime = now + 250; // Pisca a cada 250ms
+        proximaPiscadaLeds = agora + 250; // Pisca a cada 250ms
       }
     } else {
       // Garante que os LEDs fiquem apagados após os 3 segundos
-      if (ledBlinkState) {
-        allLedsOff();
-        ledBlinkState = false;
+      if (estadoPiscadaLeds) {
+        apagarTodosLeds();
+        estadoPiscadaLeds = false;
       }
     }
   }
 
   // ---------------- MOSTRAR SEQUENCIA ----------------
 
-  if (state == SHOW_SEQUENCE && (int32_t)(now - nextSequenceChange) >= 0) {
+  if (estado == mostraSequencia && (int32_t)(agora - proximaMudancaSequencia) >= 0) {
     
     // APAGA AS LUZES DE PARABÉNS LOGO ANTES DE COMEÇAR A NOVA SEQUÊNCIA
-    if (showIndex == 0 && shownLed == 255) allLedsOff();
+    if (indiceExibicao == 0 && ledExibido == 255) apagarTodosLeds();
 
-    if (shownLed != 255) {
-      digitalWrite(ledPins[shownLed], LOW);
-      shownLed = 255;
-      nextSequenceChange = now + 250;
-    } else if (showIndex < sequenceLength) {
-      shownLed = sequence[showIndex];
-      digitalWrite(ledPins[shownLed], HIGH);
-      beep(440 + shownLed * 110, 130);
-      showIndex++;
-      nextSequenceChange = now + 500;
+    if (ledExibido != 255) {
+      digitalWrite(pinosLeds[ledExibido], LOW);
+      ledExibido = 255;
+      proximaMudancaSequencia = agora + 250;
+    } else if (indiceExibicao < tamanhoSequencia) {
+      ledExibido = sequencia[indiceExibicao];
+      digitalWrite(pinosLeds[ledExibido], HIGH);
+      tocarBip(440 + ledExibido * 110, 130);
+      indiceExibicao++;
+      proximaMudancaSequencia = agora + 500;
     } else {
-      stopBeep();
-      allLedsOff();
-      state = WAIT_INPUT;
-      inputIndex = 0;
-      secondsLeft = 5 + sequenceLength;
-      timeExpired = false;
+      pararBip();
+      apagarTodosLeds();
+      estado = esperaJogador;
+      indiceJogador = 0;
+      segundosRestantes = 5 + tamanhoSequencia;
+      tempoEsgotado = false;
     }
   }
 
   // ---------------- LER BOTAO PRESSIONADO ----------------
 
-  uint8_t button = 255;
+  uint8_t botao = 255;
 
   noInterrupts();
-  button = pressedButton;
-  pressedButton = 255;
+  botao = botaoPressionado;
+  botaoPressionado = 255;
   interrupts();
 
   // ---------------- VALIDAR RESPOSTA ----------------
 
-  if (state == WAIT_INPUT && button < 4) {
+  if (estado == esperaJogador && botao < 4) {
     
     // Debounce simples de software de 120ms para a resposta do jogador
-    if (now - lastAcceptedInputMs > 120) {
-      lastAcceptedInputMs = now;
+    if (agora - ultimaEntradaAceitaMs > 120) {
+      ultimaEntradaAceitaMs = agora;
 
-      if (button == sequence[inputIndex]) {
+      if (botao == sequencia[indiceJogador]) {
         // Resposta correta: Acende o LED correspondente e bipa
-        digitalWrite(ledPins[button], HIGH);
-        inputIndex++;
-        beep(600 + button * 100, 70);
+        digitalWrite(pinosLeds[botao], HIGH);
+        indiceJogador++;
+        tocarBip(600 + botao * 100, 70);
 
-        if (inputIndex >= sequenceLength) {
+        if (indiceJogador >= tamanhoSequencia) {
           // O jogador completou a sequencia (ACERTOU TUDO!)
-          level++;
+          nivelAtual++;
 
           // --- FEEDBACK DE PARABÉNS ---
           for (uint8_t i = 0; i < 4; i++) {
-            digitalWrite(ledPins[i], HIGH);
+            digitalWrite(pinosLeds[i], HIGH);
           }
-          beep(1200, 300);
+          tocarBip(1200, 300);
           // -----------------------------
 
-          if (sequenceLength < sizeof(sequence)) {
-            sequence[sequenceLength++] = random(0, 4);
+          if (tamanhoSequencia < sizeof(sequencia)) {
+            sequencia[tamanhoSequencia++] = random(0, 4);
           }
           
-          state = SHOW_SEQUENCE;
-          showIndex = 0;
-          shownLed = 255;
-          nextSequenceChange = now + 800; // Tempo do "flash" de vitória antes de reiniciar
-          secondsLeft = 0;
+          estado = mostraSequencia;
+          indiceExibicao = 0;
+          ledExibido = 255;
+          proximaMudancaSequencia = agora + 800; // Tempo do "flash" de vitória antes de reiniciar
+          segundosRestantes = 0;
         }
       } else {
-        gameOver();
+        acionarFimDeJogo();
       }
     }
   }
